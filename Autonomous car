@@ -1,0 +1,478 @@
+#include <SoftwareSerial.h>
+#include <TinyGPS.h>
+#include <Wire.h>
+#include <I2Cdev.h>
+#include <HMC5883L.h>
+
+// Motor control pins
+int BPWM = 11;       // Motor B PWM pin (steering)
+int MotorB1 = 13;    // Motor B direction pin 1  
+int MotorB2 = 8;     // Motor B direction pin 2
+int APWM = 10;       // Motor A PWM pin
+int MotorA1 = 12;    // Motor A direction pin 1 
+int MotorA2 = 3;     // Motor A direction pin 2
+
+int PWMSET = 255;     // Set Speed Motor 100% = 255
+
+#define BUZZER_PIN 4          // Output pin for the buzzer
+#define TOLERANCE_RADIUS 2.0  // Tolerance radius for reaching the goal
+
+// Robot car velocities. Change if you want to adjust the car's behavior
+#define FORWARD_VEL     230 
+#define SLOW_TURN_VEL   200 
+#define PIVOT_WHEEL_VEL 50 
+#define FAST_TURN_VEL   255
+
+// Constants for defining error ranges for the stepped proportional control
+#define MAX_HEADING_ANGLE  180
+#define MIN_HEADING_ANGLE  5
+#define ANGLE_RANGE_DIV 0.25
+
+// Calibration constants for the motors in differential drive config
+#define K_RIGHT_MOTOR 1.0
+#define K_LEFT_MOTOR 1.0
+
+String str_action;
+
+// Bluetooth setup
+SoftwareSerial btSerial(8, 9); // RX, TX pins for Bluetooth
+
+// GPS setup
+TinyGPS gps;
+HMC5883L compass;  
+SoftwareSerial serial_gps(6, 7); // RX and TX pins in use
+
+// Mode control variables
+bool isAutonomousMode = false;
+
+// Globals for storing waypoints
+#define MAX_WAYPOINTS 100 // Define maximum number of waypoints
+struct t_waypoint { 
+  float lat;
+  float lon;
+};
+
+// Waypoints for navigation
+t_waypoint nav_waypoints[MAX_WAYPOINTS];
+byte waypoint_index = 0;  // Index to the current waypoint in array
+int num_waypoints = 0; // Number of waypoints received
+
+// Auxiliary variables for computing the navigation vector:
+float waypoint_lat_rad; 
+float waypoint_lon_rad;
+
+// Globals for compass readings
+int16_t mx, my, mz;   // Earth's magnetic field components
+float compass_angle;  // Stores the angle retrieved from the compass
+
+// Magnetic declination in my current area/city
+const float mag_declination = 11.83; 
+
+int heading_error; // Stores the heading error
+
+// Globals for GPS readings
+float f_gps_reading_lat, f_gps_reading_lon; // Stores the reading from the GPS receiver
+float waypoint_angle; // Stores the azimuth to the current goal
+float last_calc_dist = 0; // Last computed distance to goal (for debugging)
+
+// Auxiliaries for dumping GPS data
+long lat, lon; 
+unsigned long age, date, gpstime, chars;
+unsigned short sentences, failed;
+
+// Globals for the moving average filter
+#define NUM_FILTERING_POINTS  15 
+float buffer_gps_lat[NUM_FILTERING_POINTS]; // Buffer for latitudes
+float buffer_gps_lon[NUM_FILTERING_POINTS]; // Buffer for longitudes
+t_waypoint gps_filtered; // For storing a filtered GPS reading
+unsigned int buffer_fill_index = 0; // Index for filling filter buffers
+
+/* Setup function */
+void setup() {
+  // Initialize motor pins and buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MotorA1, OUTPUT);
+  pinMode(MotorA2, OUTPUT);
+  pinMode(APWM, OUTPUT);
+  pinMode(MotorB1, OUTPUT);
+  pinMode(MotorB2, OUTPUT);
+  pinMode(BPWM, OUTPUT);
+
+  stopMotors();
+  // Initialize compass
+  Wire.begin();
+  Serial.begin(115200);   // Initialize serial comm. for debugging
+  // Initialize Bluetooth serial communication
+  btSerial.begin(9600); // HC-06 default baud rate
+  // Initialize GPS serial communication
+  serial_gps.begin(9600); // Initialize serial comm. with the GPS module
+
+  // Start with a buzzer sound
+  pinMode(BUZZER_PIN, OUTPUT); // Initialize the buzzer pin
+  compass.initialize();   // Initialize the compass
+  delay(1000);
+  Buzzer();   
+}
+
+void loop() {
+  // Check if Bluetooth command is available
+  if (btSerial.available()) {
+    char command = btSerial.read();  // Read the command from Bluetooth
+
+    if (command == 'A') {
+      isAutonomousMode = true;  // Switch to autonomous mode
+    } else if (command == 'M') {
+      isAutonomousMode = false;  // Switch to manual mode
+      stopMotors();              // Stop motors when switching modes
+    } else if (command == 'W') { // Command to receive waypoints
+      receiveWaypoint();
+    }
+
+    if (!isAutonomousMode) {
+      // Manual mode
+      switch (command) {
+        case 'F':  // Move Motor A forward
+          moveForward();
+          break;
+        case 'B':  // Move Motor A backward
+          moveBackward();
+          break;
+        case 'R':  // Turn right (Motor B)
+          turnRight();
+          break;
+        case 'L':  // Turn left (Motor B)
+          turnLeft();
+          break;
+        case 'S':  // Stop both motors
+          stopMotors();
+          break;
+        default:
+          stopMotors();  // Stop motors if no valid command
+          break;
+      }
+    }
+  }
+
+  // Autonomous mode
+  if (isAutonomousMode) {
+    navigateToGPS();
+
+    // Continuously check for 'M' command to switch back to manual mode
+    if (btSerial.available()) {
+      char command = btSerial.read();
+      if (command == 'M') {
+        isAutonomousMode = false;  // Switch back to manual mode
+        stopMotors();              // Stop motors when switching modes
+      }
+    }
+  }
+}
+
+// Function to receive waypoints via Bluetooth
+void receiveWaypoint() {
+  if (btSerial.available()) {
+    String waypointData = btSerial.readStringUntil('\n'); // Read until newline
+    float lat, lon;
+    int numParsed = sscanf(waypointData.c_str(), "%f,%f", &lat, &lon); // Parse latitude and longitude
+
+    if (numParsed == 2 && num_waypoints < MAX_WAYPOINTS) {
+      nav_waypoints[num_waypoints].lat = lat;
+      nav_waypoints[num_waypoints].lon = lon;
+      num_waypoints++;
+      Serial.print("Waypoint received: ");
+      Serial.print(lat);
+      Serial.print(", ");
+      Serial.println(lon);
+    } else {
+      Serial.println("Invalid waypoint format or maximum waypoints reached.");
+    }
+  }
+}
+
+// Function to move the vehicle forward
+void moveForward() {
+  digitalWrite(MotorA1, HIGH);
+  digitalWrite(MotorA2, LOW);
+  analogWrite(APWM, PWMSET);
+}
+
+// Function to move the vehicle backward
+void moveBackward() {
+  digitalWrite(MotorA1, LOW);
+  digitalWrite(MotorA2, HIGH);
+  analogWrite(APWM, PWMSET);
+}
+
+// Function to turn the vehicle right (Motor B)
+void turnRight() {
+  digitalWrite(MotorB1, HIGH);
+  digitalWrite(MotorB2, LOW);
+  analogWrite(BPWM, PWMSET);
+}
+
+// Function to turn the vehicle left (Motor B)
+void turnLeft() {
+  digitalWrite(MotorB1, LOW);
+  digitalWrite(MotorB2, HIGH);
+  analogWrite(BPWM, PWMSET);
+}
+
+/* Turns the car left fast pivoting */
+void Turn_Left_Fast_Spin() {
+  digitalWrite(MotorB1, LOW);
+  analogWrite(BPWM, PWMSET);
+}
+
+/* Turns the car right fast pivoting */
+void Turn_Right_Fast_Spin() {
+  digitalWrite(MotorB1, HIGH);
+  analogWrite(BPWM, PWMSET);
+}
+
+// Function to stop both motors
+void stopMotors() {
+  analogWrite(APWM, 0); // Stop Motor A
+  analogWrite(BPWM, 0); // Stop Motor B
+}
+
+// Function to move autonomously
+void navigateToGPS() {
+  while (true) {
+    // Check for Bluetooth command to switch to manual mode
+    if (btSerial.available()) {
+      char command = btSerial.read();
+      if (command == 'M') {
+        isAutonomousMode = false;
+        stopMotors();
+        return;  // Exit autonomous mode and go back to manual mode
+      }
+    }
+
+    // Update compass heading
+    Get_Compass_Heading();
+
+    // Query GPS and update navigation vector
+    if (Query_Gps()) {
+      Gps_Dump(gps);  // Read the GPS for debugging
+
+      // Store the new GPS reading in filter buffers
+      Store_Gps_Reading(f_gps_reading_lat, f_gps_reading_lon);
+
+      // Get filtered GPS latitude and longitude
+      gps_filtered = Compute_Filtered_Gps();
+
+      // Compute distance and heading to the goal
+      Compute_Navigation_Vector(gps_filtered.lat, gps_filtered.lon);
+
+      // Print data for debugging
+      Print_Data();
+    }
+
+    // Perform navigation control based on updated data
+    Control_Navigation();
+  }
+}
+
+/* Stores a GPS reading in the moving average filter's buffers */
+void Store_Gps_Reading(float lat, float lon) {
+  // Shift all buffer values towards the tail
+  for (int i = (NUM_FILTERING_POINTS - 1); i > 0; --i) {
+    buffer_gps_lat[i] = buffer_gps_lat[i-1];
+    buffer_gps_lon[i] = buffer_gps_lon[i-1];
+  }
+
+  // Insert new values at the head
+  buffer_gps_lat[0] = lat;
+  buffer_gps_lon[0] = lon;
+
+  // Increment the number of readings stored in buffers
+  if(buffer_fill_index < NUM_FILTERING_POINTS) {
+    ++buffer_fill_index;
+  }
+}
+
+/* Computes filtered latitude and longitude using a moving average filter */
+t_waypoint Compute_Filtered_Gps() {
+  float lat_sum;
+  float lon_sum;
+  
+  t_waypoint filtered_waypoint;
+
+  lat_sum = 0;
+  lon_sum = 0;
+
+  // Add all values in each buffer
+  for (int i = 0; i < buffer_fill_index; ++i) {
+    lat_sum += buffer_gps_lat[i];
+    lon_sum += buffer_gps_lon[i];
+  }
+
+  // Take the average
+  filtered_waypoint.lat = lat_sum / float(buffer_fill_index);
+  filtered_waypoint.lon = lon_sum / buffer_fill_index;
+  
+  return filtered_waypoint; // Return filtered values
+}
+
+/* Queries the GPS receiver */
+bool Query_Gps() {
+  while (serial_gps.available()) {
+    if (gps.encode(serial_gps.read())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Gets a reading from the compass */
+void Get_Compass_Heading(void) {
+  // Obtain magnetic field components in x, y and z
+  compass.getHeading(&mx, &my, &mz);
+
+  // Calculate the X axis angle W.R.T. North
+  compass_angle = atan2(my, mx);
+  compass_angle = compass_angle * RAD_TO_DEG; // RAD_TO_DEG = 180/M_PI
+  compass_angle = compass_angle - mag_declination; // Compensate for magnetic declination
+
+  // Always convert to positive angles
+  if (compass_angle < 0) {
+    compass_angle += 360;
+  }
+}
+
+/* Computes the navigation vector */
+void Compute_Navigation_Vector(float gps_lat, float gps_lon) {
+  t_waypoint cur_waypoint; 
+
+  // Get current goal
+  cur_waypoint = Get_Waypoint_With_Index(waypoint_index);
+
+  float gps_f_lat_rad;
+  float gps_f_lon_rad;
+  float a_haversine = 0;
+  float c_haversine = 0;
+  float d_haversine = 0;
+  float parcial = 0;
+  float delta_lat = 0;
+  float delta_lon = 0;
+
+  // Compute the distance to the goal with Haversine formula
+  delta_lat = radians(cur_waypoint.lat - gps_lat); 
+  gps_f_lat_rad = radians(gps_lat);
+  waypoint_lat_rad = radians(cur_waypoint.lat);
+  delta_lon = radians(cur_waypoint.lon - gps_lon);
+  
+  a_haversine = sin(delta_lat / 2.0) * sin(delta_lat / 2.0);
+  parcial = cos(gps_f_lat_rad) * cos(waypoint_lat_rad);
+  parcial = parcial * sin(delta_lon / 2.0) * sin(delta_lon / 2.0);
+  a_haversine += parcial;
+  
+  c_haversine = 2 * atan2(sqrt(a_haversine), sqrt(1.0 - a_haversine));
+  
+  d_haversine = 6371000.0 * c_haversine; // Multiply by Earth's radius in meters
+  
+  last_calc_dist = d_haversine;
+
+  // Check if we are inside the goal's tolerance radius
+  if (d_haversine < TOLERANCE_RADIUS) {
+    stopMotors();       // Stop the car
+    delay(3000);  // Delay just to check visually where exactly the car reached the goal
+    waypoint_index++; // Switch to the next waypoint
+    Buzzer(); delay( 100); Buzzer(); // Beep to signal 'waypoint reached'
+  }
+
+  // Check if we reached all waypoints 
+  if (waypoint_index == num_waypoints) {
+    stopMotors(); // Stop the car
+    // Beep to signal 'all waypoints reached':
+    Buzzer(); delay(100); Buzzer(); delay(100); Buzzer();
+    while (1); // Stop the program (reset Arduino board to repeat)
+  }
+  
+  // Compute the forward azimuth
+  gps_f_lon_rad = radians(gps_lon);  
+  waypoint_lon_rad = radians(cur_waypoint.lon);
+
+  waypoint_angle = atan2(sin(waypoint_lon_rad - gps_f_lon_rad) * cos(waypoint_lat_rad), 
+                cos(gps_f_lat_rad) * sin(waypoint_lat_rad) - sin(gps_f_lat_rad) * cos(waypoint_lat_rad) * cos(waypoint_lon_rad - gps_f_lon_rad));
+  
+  waypoint_angle = waypoint_angle * 180 / PI; // Convert from radians to degrees
+
+  // Always convert to positive angles
+  if (waypoint_angle < 0) {
+    waypoint_angle += 360;
+  }
+}
+
+/* Controls the robot car navigation towards the goal */
+void Control_Navigation() {
+  heading_error = (waypoint_angle - compass_angle); // Compute the heading error
+  
+  // Correct angle for wrap around
+  if (heading_error < -180) {
+    heading_error += 360;
+  }
+  if (heading_error > 180) {
+    heading_error -= 360;
+  }
+
+  // ----- Stepped proportional control
+  if (heading_error > MIN_HEADING_ANGLE && heading_error <= MAX_HEADING_ANGLE * ANGLE_RANGE_DIV) {
+    // Turn right
+    turnRight();
+    str_action = "Right";
+  } else if (heading_error > MAX_HEADING_ANGLE * ANGLE_RANGE_DIV && heading_error <= MAX_HEADING_ANGLE) {
+    // Turn right fast
+    Turn_Right_Fast_Spin();
+    str_action = "Right fast";
+  } else if (heading_error < -MIN_HEADING_ANGLE && heading_error >= -MAX_HEADING_ANGLE * ANGLE_RANGE_DIV) {
+    // Turn left
+    turnLeft();
+    str_action = "Left";
+  } else if (heading_error < -MAX_HEADING_ANGLE * ANGLE_RANGE_DIV && heading_error >= -MAX_HEADING_ANGLE) {
+    // Turn left fast
+    Turn_Left_Fast_Spin();
+    str_action = "Left fast";
+  } else if (heading_error >= -MIN_HEADING_ANGLE && heading_error <= MIN_HEADING_ANGLE) {
+    // Forward
+    moveForward();
+    str_action = "Forward";
+  } else {
+    str_action = "Not defined";
+  }
+}
+
+/* TinyGPS auxiliary routine, comes with the library */
+void Gps_Dump(TinyGPS &gps) {
+  gps.get_position(&lat, &lon, &age);
+  gps.f_get_position(&f_gps_reading_lat, &f_gps_reading_lon, &age);
+  Query_Gps();
+  gps.stats(&chars, &sentences, &failed);
+}
+
+/* Returns a waypoint from the array */
+struct t_waypoint Get_Waypoint_With_Index(int index) {
+  return nav_waypoints[index]; 
+}
+
+/* Generates a beep with a passive buzzer */
+void Buzzer() {
+  for (int i = 0; i < 500; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(250);
+    digitalWrite(BUZZER_PIN, LOW);
+    delayMicroseconds(250);
+  }
+}
+
+/* Prints data to the serial port for debugging */
+void Print_Data(void) {
+  Serial.print("GPSLAT: "); Serial.print(1000000 * f_gps_reading_lat, 1);
+  Serial.print(" GPSLATF: "); Serial.print(1000000 * gps_filtered.lat, 1);
+  Serial.print(" GPSLON: "); Serial.print(1000000 * f_gps_reading_lon, 1);
+  Serial.print(" GPSLONF: "); Serial.print(1000000 * gps_filtered.lon, 1);
+  Serial.print(" CMPANG: "); Serial.print(compass_angle);
+  Serial.print(" GPSANG: "); Serial.print(waypoint_angle);
+  Serial.print(" HDERR: "); Serial.print(heading_error);
+  Serial.println();
+}
